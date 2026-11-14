@@ -143,6 +143,8 @@ func (m *Manager) Addresses() []*appmessage.NetAddress {
 
 // AddressCount returns number of known nodes.
 func (m *Manager) AddressCount() int {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
 	return len(m.nodes)
 }
 
