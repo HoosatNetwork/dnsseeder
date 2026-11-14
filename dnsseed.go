@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Hoosat-Oy/HTND/app/protocol/common"
 	"github.com/Hoosat-Oy/HTND/infrastructure/config"
 	"github.com/Hoosat-Oy/HTND/infrastructure/network/netadapter/standalone"
 
@@ -30,6 +29,12 @@ import (
 
 	_ "net/http/pprof"
 )
+
+// addressesTimeout bounds the wait for the second address reply in pollPeer.
+// The peer already answered the same request during the handshake, and polls
+// run one at a time, so a peer that never answers must not hold up the round
+// for the full default timeout.
+const addressesTimeout = 15 * time.Second
 
 var (
 	amgr             *Manager
@@ -89,7 +94,6 @@ func creep() {
 		}
 	}
 
-	var wgCreep sync.WaitGroup
 	for {
 		peers := amgr.Addresses()
 		if len(peers) == 0 && amgr.AddressCount() == 0 {
@@ -101,8 +105,11 @@ func creep() {
 			peers = amgr.Addresses()
 		}
 		if len(peers) == 0 {
-			log.Infof("No stale addresses -- sleeping for 10 minutes")
-			for i := 0; i < 600; i++ {
+			// Sleep only a minute: with a small address book nothing is
+			// due most of the time, and a longer sleep would push the
+			// re-check of a good node close to the cut-off for serving it.
+			log.Infof("No stale addresses -- sleeping for 1 minute")
+			for i := 0; i < 60; i++ {
 				time.Sleep(time.Second)
 				if atomic.LoadInt32(&systemShutdown) != 0 {
 					log.Infof("Creep thread shutdown")
@@ -112,27 +119,22 @@ func creep() {
 			continue
 		}
 
+		// Poll one at a time, in the order given: the net adapter serializes
+		// connections anyway, and the order puts due re-checks of good nodes
+		// ahead of unchecked addresses.
 		for _, addr := range peers {
 			if atomic.LoadInt32(&systemShutdown) != 0 {
-				log.Infof("Waiting creep threads to terminate")
-				wgCreep.Wait()
 				log.Infof("Creep thread shutdown")
 				return
 			}
-			wgCreep.Add(1)
-			go func(addr *appmessage.NetAddress) {
-				defer wgCreep.Done()
-
-				err := pollPeer(netAdapter, addr)
-				if err != nil {
-					log.Debugf(err.Error())
-					if defaultSeeder != nil && addr == defaultSeeder {
-						panics.Exit(log, "failed to poll default seeder")
-					}
+			err := pollPeer(netAdapter, addr)
+			if err != nil {
+				log.Debugf(err.Error())
+				if defaultSeeder != nil && addr == defaultSeeder {
+					panics.Exit(log, "failed to poll default seeder")
 				}
-			}(addr)
+			}
 		}
-		wgCreep.Wait()
 	}
 }
 
@@ -155,7 +157,7 @@ func pollPeer(netAdapter *standalone.MinimalNetAdapter, addr *appmessage.NetAddr
 		return errors.Wrapf(err, "failed to request addresses from %s", peerAddress)
 	}
 
-	message, err := routes.WaitForMessageOfType(appmessage.CmdAddresses, common.DefaultTimeout)
+	message, err := routes.WaitForMessageOfType(appmessage.CmdAddresses, addressesTimeout)
 	if err != nil {
 		return errors.Wrapf(err, "failed to receive addresses from %s", peerAddress)
 	}
@@ -188,15 +190,16 @@ func main() {
 		profiling.Start(cfg.Profile, log)
 	}
 
-	amgr, err = NewManager(cfg.AppDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "NewManager: %v\n", err)
-		os.Exit(1)
-	}
-
+	// Set the default port before NewManager starts the pruner, which reads it.
 	peersDefaultPort, err = strconv.Atoi(ActiveConfig().NetParams().DefaultPort)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid peers default port %s: %v\n", ActiveConfig().NetParams().DefaultPort, err)
+		os.Exit(1)
+	}
+
+	amgr, err = NewManager(cfg.AppDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "NewManager: %v\n", err)
 		os.Exit(1)
 	}
 

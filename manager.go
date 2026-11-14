@@ -35,6 +35,7 @@ type Manager struct {
 	mtx sync.RWMutex
 
 	nodes     map[string]*Node
+	failed    map[string]time.Time
 	wg        sync.WaitGroup
 	quit      chan struct{}
 	peersFile string
@@ -62,12 +63,29 @@ const (
 	// pruneExpireTimeout is the expire time in which a node is
 	// considered dead.
 	pruneExpireTimeout = time.Hour * 8
+
+	// failedCooldown is how long an address that was tried and never
+	// answered is ignored when peers advertise it again. Peers re-advertise
+	// dead addresses within minutes, so without it the crawler keeps
+	// dialling the same dead addresses.
+	failedCooldown = time.Hour * 6
+
+	// recheckGoodInterval is how long after its last check a good node is
+	// checked again. It is shorter than defaultStaleTimeout so that a good
+	// node is re-verified before it drops out of the DNS answers.
+	recheckGoodInterval = time.Minute * 45
+
+	// maxUncheckedPerRound caps the unchecked addresses polled per crawl
+	// round. A peer can stall a handshake for minutes, so this bounds how
+	// long a round can delay the re-checks of the next one.
+	maxUncheckedPerRound = 4
 )
 
 // NewManager constructs and returns a new dnsseeder manager, with the provided dataDir
 func NewManager(dataDir string) (*Manager, error) {
 	amgr := Manager{
 		nodes:     make(map[string]*Node),
+		failed:    make(map[string]time.Time),
 		peersFile: filepath.Join(dataDir, peersFilename),
 		quit:      make(chan struct{}),
 	}
@@ -93,9 +111,15 @@ func NewManager(dataDir string) (*Manager, error) {
 // address currently held
 func (m *Manager) AddAddresses(addrs []*appmessage.NetAddress) int {
 	var count int
+	now := time.Now()
 
 	m.mtx.Lock()
 	for _, addr := range addrs {
+		// Only the default port is polled and served, and nodes are keyed by
+		// IP, so another port would only shadow the same IP on the default one.
+		if addr.Port != uint16(peersDefaultPort) {
+			continue
+		}
 		if !addressmanager.IsRoutable(addr, ActiveConfig().NetParams().AcceptUnroutable) {
 			continue
 		}
@@ -103,12 +127,15 @@ func (m *Manager) AddAddresses(addrs []*appmessage.NetAddress) int {
 
 		_, exists := m.nodes[addrStr]
 		if exists {
-			m.nodes[addrStr].LastSeen = time.Now()
+			m.nodes[addrStr].LastSeen = now
+			continue
+		}
+		if failedAt, ok := m.failed[addrStr]; ok && now.Sub(failedAt) < failedCooldown {
 			continue
 		}
 		node := Node{
 			Addr:     addr,
-			LastSeen: time.Now(),
+			LastSeen: now,
 		}
 		m.nodes[addrStr] = &node
 		count++
@@ -118,23 +145,31 @@ func (m *Manager) AddAddresses(addrs []*appmessage.NetAddress) int {
 	return count
 }
 
-// Addresses returns IPs that need to be tested again.
+// Addresses returns IPs that need to be tested again: good nodes that are due
+// for a re-check first, then addresses that have not answered yet.
 func (m *Manager) Addresses() []*appmessage.NetAddress {
-	addrs := make([]*appmessage.NetAddress, 0, defaultMaxAddresses*8)
+	addrs := make([]*appmessage.NetAddress, 0, defaultMaxAddresses)
 	now := time.Now()
-	i := defaultMaxAddresses
 
 	m.mtx.RLock()
 	for _, node := range m.nodes {
-		if i == 0 {
+		if len(addrs) == defaultMaxAddresses {
 			break
 		}
-		if now.Sub(node.LastSuccess) < defaultStaleTimeout ||
-			now.Sub(node.LastAttempt) < defaultStaleTimeout {
+		if !node.LastSuccess.IsZero() && now.Sub(node.LastAttempt) >= recheckGoodInterval {
+			addrs = append(addrs, node.Addr)
+		}
+	}
+	unchecked := 0
+	for _, node := range m.nodes {
+		if len(addrs) == defaultMaxAddresses || unchecked == maxUncheckedPerRound {
+			break
+		}
+		if !node.LastSuccess.IsZero() || now.Sub(node.LastAttempt) < defaultStaleTimeout {
 			continue
 		}
 		addrs = append(addrs, node.Addr)
-		i--
+		unchecked++
 	}
 	m.mtx.RUnlock()
 
@@ -253,13 +288,28 @@ func (m *Manager) prunePeers() {
 		return !node.LastSuccess.IsZero() && now.Sub(node.LastSuccess) > pruneExpireTimeout
 	}
 
+	// Entries on another port come from older address books; they are never
+	// dialled, so they are dropped without a cooldown for their IP.
+	wrongPort := func(node *Node) bool {
+		return node.Addr.Port != uint16(peersDefaultPort)
+	}
+
 	for k, node := range m.nodes {
-		if lastSeenAbovePruneExpire(node) ||
+		if !wrongPort(node) && hadAttemptsButNoSuccess(node) {
+			m.failed[k] = now
+		}
+		if wrongPort(node) ||
+			lastSeenAbovePruneExpire(node) ||
 			hadAttemptsButNoSuccess(node) ||
 			hadSuccessButLongTimeAgo(node) {
 
 			delete(m.nodes, k)
 			count++
+		}
+	}
+	for k, failedAt := range m.failed {
+		if now.Sub(failedAt) >= failedCooldown {
+			delete(m.failed, k)
 		}
 	}
 	l := len(m.nodes)
